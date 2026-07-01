@@ -18,7 +18,6 @@ USER appuser
 
 EXPOSE 8000
 
-CMD ["gunicorn", "-w", "1", "--threads", "4", \
-     "-b", "0.0.0.0:8000", \
-     "--access-logfile", "-", "--error-logfile", "-", \
-     "app.server:app"]
+CMD ["uvicorn", "app.server:app", \
+     "--host", "0.0.0.0", "--port", "8000", \
+     "--workers", "1", "--access-log"]

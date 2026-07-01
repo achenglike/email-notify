@@ -1,9 +1,15 @@
+import contextlib
 import logging
 
-from flask import Flask, request, jsonify
+import anyio
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
 
-from .auth import require_api_key
-from .mailer import send_alert, MailSendError, ConfigError
+from .auth import is_authorized
+from .mailer import ConfigError, MailSendError, send_alert
+from .mcp_tools import mcp
 
 logging.basicConfig(
     level=logging.INFO,
@@ -11,7 +17,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger("email-notify")
 
-app = Flask(__name__)
+mcp_streamable = mcp.streamable_http_app()
+
+
+@contextlib.asynccontextmanager
+async def lifespan(app: Starlette):
+    async with mcp.session_manager.run():
+        yield
 
 
 def _is_non_empty_str(value) -> bool:
@@ -37,46 +49,91 @@ def _validate_payload(payload):
     return None
 
 
-@app.get("/healthz")
-def healthz():
-    return jsonify({"status": "ok"}), 200
+async def healthz(request: Request):
+    return JSONResponse({"status": "ok"})
 
 
-@app.post("/api/send")
-@require_api_key
-def send():
-    payload = request.get_json(silent=True)
-    if payload is None:
-        return jsonify({"error": "invalid or missing JSON body"}), 400
+async def api_send(request: Request):
+    try:
+        payload = await request.json()
+    except Exception:
+        return JSONResponse({"error": "invalid or missing JSON body"}, status_code=400)
 
     err = _validate_payload(payload)
     if err:
-        return jsonify({"error": err}), 400
+        return JSONResponse({"error": err}, status_code=400)
 
     recipients = payload["recipients"]
     subject = payload["subject"]
     message_body = payload["message_body"]
 
     try:
-        send_alert(recipients, subject, message_body)
+        await anyio.to_thread.run_sync(
+            send_alert, recipients, subject, message_body
+        )
     except ConfigError as exc:
         logger.error("config error: %s", exc)
-        return jsonify({"error": "server_misconfigured", "detail": str(exc)}), 500
+        return JSONResponse(
+            {"error": "server_misconfigured", "detail": str(exc)}, status_code=500
+        )
     except MailSendError as exc:
         logger.error("smtp failed: %s", exc)
-        return jsonify({"error": "smtp_failed", "detail": str(exc)}), 502
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 400
+        return JSONResponse(
+            {"error": "smtp_failed", "detail": str(exc)}, status_code=502
+        )
     except Exception as exc:
         logger.exception("unexpected error")
-        return jsonify({"error": "internal", "detail": str(exc)}), 500
+        return JSONResponse({"error": "internal", "detail": str(exc)}, status_code=500)
 
     logger.info(
         "sent subject=%r recipients_count=%d path=%s",
-        subject, len(recipients), request.path,
+        subject, len(recipients), request.url.path,
     )
-    return jsonify({"status": "sent", "recipients": recipients}), 200
+    return JSONResponse({"status": "sent", "recipients": recipients})
 
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+async def _unauthorized(scope, receive, send):
+    response = JSONResponse({"error": "unauthorized"}, status_code=401)
+    await response(scope, receive, send)
+
+
+class BearerAuthMiddleware:
+    """Validate Bearer token for /api/send and /mcp; exempt /healthz.
+
+    Stateless: wraps the ASGI app, no session storage.
+    """
+
+    PUBLIC_PATHS = {"/healthz"}
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+
+        path = scope["path"]
+        if path in self.PUBLIC_PATHS:
+            return await self.app(scope, receive, send)
+
+        auth_header = ""
+        for raw_name, raw_value in scope.get("headers", []):
+            if raw_name == b"authorization":
+                auth_header = raw_value.decode("latin-1")
+                break
+
+        if not is_authorized(auth_header):
+            return await _unauthorized(scope, receive, send)
+
+        return await self.app(scope, receive, send)
+
+
+inner = Starlette(
+    routes=[
+        Route("/healthz", healthz, methods=["GET"]),
+        Route("/api/send", api_send, methods=["POST"]),
+        Mount("/mcp", app=mcp_streamable),
+    ],
+    lifespan=lifespan,
+)
+app = BearerAuthMiddleware(inner)
