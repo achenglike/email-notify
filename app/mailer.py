@@ -29,6 +29,10 @@ def _build_config() -> dict:
     }
 
 
+def _is_implicit_ssl_port(port: str) -> bool:
+    return port.strip() in {"465", "994"}
+
+
 def send_alert(recipients, subject, message_body):
     if not recipients:
         raise ValueError("recipients must be a non-empty list")
@@ -43,8 +47,14 @@ def send_alert(recipients, subject, message_body):
 
     context = ssl.create_default_context()
     try:
-        with smtplib.SMTP(cfg["smtp_server"], cfg["smtp_port"], timeout=30) as server:
-            server.starttls(context=context)
+        if _is_implicit_ssl_port(cfg["smtp_port"]):
+            client = smtplib.SMTP_SSL(
+                cfg["smtp_server"], cfg["smtp_port"], timeout=30, context=context
+            )
+        else:
+            client = smtplib.SMTP(cfg["smtp_server"], cfg["smtp_port"], timeout=30)
+            client.starttls(context=context)
+        with client as server:
             server.login(cfg["sender_mail"], cfg["sender_pw"])
             server.sendmail(cfg["sender_mail"], recipients, message.as_string())
     except (smtplib.SMTPException, OSError, ssl.SSLError) as exc:

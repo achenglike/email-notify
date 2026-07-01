@@ -212,7 +212,7 @@ Claude Desktop 配置示例（`claude_desktop_config.json`）：
 | `API_KEY` | REST 与 MCP 共用的 Bearer Token，建议 ≥ 32 字节 | `openssl rand -hex 32` |
 | `MCP_ALLOWED_HOSTS` | MCP 允许的 Host 头白名单（逗号分隔，支持 `host:*`）。默认仅本机；外部访问需设置。设为 `*` 表示全放开（关闭 Host 校验，仅靠 Bearer Token 鉴权） | `notify.example.com:*,10.0.0.5:*` 或 `*` |
 
-> **注意**：当前实现固定使用 `STARTTLS`。若服务只支持 SSL 直连（如 465），需在 `app/mailer.py` 中把 `smtplib.SMTP` 换成 `smtplib.SMTP_SSL`。
+> **注意**：加密模式按 `SMTP_PORT` 自动选择——`465`/`994` 走隐式 SSL（`SMTP_SSL`），`25`/`587` 走 STARTTLS。云服务器默认封出站 25 端口，建议用 `465`。
 
 ---
 
@@ -269,13 +269,23 @@ uvicorn 默认单 worker。SMTP 是阻塞 I/O，已在 Starlette 里通过 `anyi
 ## 常见问题
 
 <details>
+<summary><b>返回 <code>502 smtp_failed: [Errno 101] Network unreachable</code> 或发不出信</b></summary>
+
+通常是 **IPv6 优先但无 IPv6 路由** + **云厂商封出站 25 端口**（腾讯云/阿里云/AWS 默认都封 25）叠加导致。解决：把 `SMTP_PORT` 改成 **465**（SSL，云厂商不封）：
+
+```dotenv
+SMTP_PORT=465
+```
+
+代码已按端口自动选择模式：`465`/`994` 走隐式 SSL（`SMTP_SSL`），`25`/`587` 走 STARTTLS。无需改代码。
+
+> 若 465 也连不通，可能是服务器缺 SSL 证书校验链或防火墙问题；可临时改 `.env` 用 587（STARTTLS）尝试。
+</details>
+
+<details>
 <summary><b>返回 <code>502 smtp_failed: [SSL] WRONG_VERSION_NUMBER</code></b></summary>
 
-你的 SMTP 端口可能需要 SSL 直连而非 STARTTLS。修改 `app/mailer.py`：
-
-```python
-with smtplib.SMTP_SSL(cfg["smtp_server"], cfg["smtp_port"], context=context, timeout=30) as server:
-```
+端口和加密模式不匹配。`SMTP_PORT=465` 必须配合隐式 SSL（代码已自动处理）；若你强行用 25 走 SSL 或 465 走 STARTTLS 会报此错。保持端口默认映射即可：465/994 → SSL，25/587 → STARTTLS。
 </details>
 
 <details>
